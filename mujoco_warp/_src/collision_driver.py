@@ -338,6 +338,7 @@ def _broadphase_filter(opt_broadphase_filter: int, ngeom_aabb: int, ngeom_rbound
 def _add_geom_pair(
   # Model:
   geom_type: wp.array[int],
+  geom_dataid: wp.array2d[int],
   nxn_pairid: wp.array[wp.vec2i],
   # Data in:
   naconmax_in: int,
@@ -353,6 +354,13 @@ def _add_geom_pair(
   collision_pairid_out: wp.array[wp.vec2i],
   collision_worldid_out: wp.array[int],
 ):
+  # HDMI: missing mesh slots must not produce collision candidates.
+  setid = worldid % geom_dataid.shape[0]
+  if geom_type[geom1] == GeomType.MESH and geom_dataid[setid, geom1] < 0:
+    return
+  if geom_type[geom2] == GeomType.MESH and geom_dataid[setid, geom2] < 0:
+    return
+
   pairid = wp.atomic_add(ncollision_out, 0, 1)
 
   if pairid >= naconmax_in:
@@ -435,6 +443,7 @@ def _sap_broadphase(
     # Model:
     ngeom: int,
     geom_type: wp.array[int],
+    geom_dataid: wp.array2d[int],
     geom_bodyid: wp.array[int],
     geom_aabb: wp.array3d[wp.vec3],
     geom_rbound: wp.array2d[float],
@@ -521,6 +530,7 @@ def _sap_broadphase(
       ):
         _add_geom_pair(
           geom_type,
+          geom_dataid,
           nxn_pairid,
           naconmax_in,
           geom1,
@@ -661,6 +671,7 @@ def sap_broadphase(
     inputs=[
       m.ngeom,
       m.geom_type,
+      m.geom_dataid,
       m.geom_bodyid,
       m.geom_aabb,
       m.geom_rbound,
@@ -695,6 +706,7 @@ def _nxn_broadphase(
   def kernel(
     # Model:
     geom_type: wp.array[int],
+    geom_dataid: wp.array2d[int],
     geom_bodyid: wp.array[int],
     geom_aabb: wp.array3d[wp.vec3],
     geom_rbound: wp.array2d[float],
@@ -755,6 +767,7 @@ def _nxn_broadphase(
     ):
       _add_geom_pair(
         geom_type,
+        geom_dataid,
         nxn_pairid,
         naconmax_in,
         geom1,
@@ -836,6 +849,7 @@ def nxn_broadphase(
       dim=(d.nworld, m.nxn_geom_pair_filtered.shape[0]),
       inputs=[
         m.geom_type,
+        m.geom_dataid,
         m.geom_bodyid,
         m.geom_aabb,
         m.geom_rbound,

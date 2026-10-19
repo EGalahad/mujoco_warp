@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import os
 from typing import Tuple
 
 import warp as wp
@@ -727,6 +728,7 @@ def ccd_kernel_builder(
   geomgeomid: int,
   block_dim: int,
   warn_overflow: bool,
+  thread_scratch: bool = False,
 ):
   """Kernel builder for non-heightfield CCD collisions (no hfield args)."""
 
@@ -748,6 +750,7 @@ def ccd_kernel_builder(
     # Data in:
     naconmax_in: int,
     naccdmax_in: int,
+    scratchrow_in: int,
     # In:
     epa_vert_in: wp.array2d[wp.vec3],
     epa_vert_index_in: wp.array2d[int],
@@ -813,6 +816,7 @@ def ccd_kernel_builder(
     )
 
     ccdid = int(-1)
+    scratchid = int(-1)
     multiccd_idx = int(-1)
 
     if needs_epa:
@@ -822,6 +826,9 @@ def ccd_kernel_builder(
           wp.printf("CCD overflow - please increase naccdmax to %u\n", ccdid)
         wp.atomic_or(overflow_out, worldid, OverflowType.CCD)
         return
+      scratchid = ccdid
+      if wp.static(thread_scratch):
+        scratchid = scratchrow_in
       dist, ncollision, w1, w2, multiccd_idx = epa_phase(
         tolerance,
         epa_iterations,
@@ -830,12 +837,12 @@ def ccd_kernel_builder(
         geom2,
         geomtype1,
         geomtype2,
-        epa_vert_in[ccdid],
-        epa_vert_index_in[ccdid],
-        epa_face_in[ccdid],
-        epa_pr_in[ccdid],
-        epa_norm2_in[ccdid],
-        epa_horizon_in[ccdid],
+        epa_vert_in[scratchid],
+        epa_vert_index_in[scratchid],
+        epa_face_in[scratchid],
+        epa_pr_in[scratchid],
+        epa_norm2_in[scratchid],
+        epa_horizon_in[scratchid],
         wp.static(warn_overflow),
         worldid,
         overflow_out,
@@ -873,20 +880,20 @@ def ccd_kernel_builder(
 
       if multiccd_idx > -1:
         ncollision, witness1, witness2 = multicontact(
-          multiccd_polygon_in[ccdid],
-          multiccd_clipped_in[ccdid],
-          multiccd_pnormal_in[ccdid],
-          multiccd_pdist_in[ccdid],
-          multiccd_idx1_in[ccdid],
-          multiccd_idx2_in[ccdid],
-          multiccd_n1_in[ccdid],
-          multiccd_n2_in[ccdid],
-          multiccd_endvert_in[ccdid],
-          multiccd_face1_in[ccdid],
-          multiccd_face2_in[ccdid],
-          epa_vert_in[ccdid],
-          epa_vert_index_in[ccdid],
-          epa_face_in[ccdid, multiccd_idx],
+          multiccd_polygon_in[scratchid],
+          multiccd_clipped_in[scratchid],
+          multiccd_pnormal_in[scratchid],
+          multiccd_pdist_in[scratchid],
+          multiccd_idx1_in[scratchid],
+          multiccd_idx2_in[scratchid],
+          multiccd_n1_in[scratchid],
+          multiccd_n2_in[scratchid],
+          multiccd_endvert_in[scratchid],
+          multiccd_face1_in[scratchid],
+          multiccd_face2_in[scratchid],
+          epa_vert_in[scratchid],
+          epa_vert_index_in[scratchid],
+          epa_face_in[scratchid, multiccd_idx],
           w1,
           w2,
           geom1,
@@ -1097,6 +1104,7 @@ def ccd_kernel_builder(
         pair_friction,
         naconmax_in,
         naccdmax_in,
+        tid,
         epa_vert_in,
         epa_vert_index_in,
         epa_face_in,
@@ -1207,18 +1215,48 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
   # ccd collider count
   nccd = wp.zeros(len(GeomType) * (len(GeomType) + 1) // 2, dtype=int)
 
+  # Grid-stride workers finish each CCD query before starting the next.
+  # Reuse one scratch row per worker; retain the original candidate capacity.
+  thread_scratch = os.environ.get("HDMI_CCD_THREAD_SCRATCH", "0") == "1"
+  for pair in collision_table:
+    g1, g2 = pair[0].value, pair[1].value
+    if (g1 == GeomType.HFIELD or g2 == GeomType.HFIELD) and _pair_count(g1, g2)[0]:
+      thread_scratch = False
+  scratch_rows = d.naccdmax
+  ccd_kernels = {}
+  if thread_scratch:
+    scratch_rows = 1
+    for pair in collision_table:
+      g1, g2 = pair[0].value, pair[1].value
+      count, geomgeomid = _pair_count(g1, g2)
+      if g1 != GeomType.HFIELD and g2 != GeomType.HFIELD and count:
+        kernel = ccd_kernel_builder(
+          g1,
+          g2,
+          m.opt.ccd_iterations,
+          epa_iterations,
+          use_multiccd,
+          geomgeomid,
+          m.block_dim.convex_ccd,
+          bool(m.opt.warn_overflow),
+          True,
+        )
+        grid = _ccd_grid_size(kernel, d.naconmax, d.ncollision.device)
+        ccd_kernels[(g1, g2)] = (kernel, grid)
+        scratch_rows = max(scratch_rows, grid)
+
   # epa_vert: vertices in EPA polytope
-  epa_vert = wp.empty(shape=(d.naccdmax, 10 + 2 * epa_iterations), dtype=wp.vec3)
+  epa_vert = wp.empty(shape=(scratch_rows, 10 + 2 * epa_iterations), dtype=wp.vec3)
   # epa_vert_index: vertex indices in EPA polytope
-  epa_vert_index = wp.empty(shape=(d.naccdmax, 10 + 2 * epa_iterations), dtype=int)
+  epa_vert_index = wp.empty(shape=(scratch_rows, 10 + 2 * epa_iterations), dtype=int)
   # epa_face: faces of polytope represented by three indices
-  epa_face = wp.empty(shape=(d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=int)
+  epa_face = wp.empty(shape=(scratch_rows, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=int)
   # epa_pr: projection of origin on polytope faces
-  epa_pr = wp.empty(shape=(d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=wp.vec3)
+  epa_pr = wp.empty(shape=(scratch_rows, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=wp.vec3)
   # epa_norm2: epa_pr * epa_pr
-  epa_norm2 = wp.empty(shape=(d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=float)
+  epa_norm2 = wp.empty(shape=(scratch_rows, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=float)
   # epa_horizon: index pair (i j) of edges on horizon
-  epa_horizon = wp.empty(shape=(d.naccdmax, MJ_MAX_EPAHORIZON), dtype=int)
+  epa_horizon = wp.empty(shape=(scratch_rows, MJ_MAX_EPAHORIZON), dtype=int)
 
   # Contact outputs
   contact_outputs = [
@@ -1309,27 +1347,27 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
 
   # Allocate multiccd arrays only for non-heightfield collisions
   # multiccd_polygon: clipped contact surface
-  multiccd_polygon = wp.empty(shape=(d.naccdmax, 2 * nmaxpolygon), dtype=wp.vec3)
+  multiccd_polygon = wp.empty(shape=(scratch_rows, 2 * nmaxpolygon), dtype=wp.vec3)
   # multiccd_clipped: clipped contact surface (intermediate)
-  multiccd_clipped = wp.empty(shape=(d.naccdmax, 2 * nmaxpolygon), dtype=wp.vec3)
+  multiccd_clipped = wp.empty(shape=(scratch_rows, 2 * nmaxpolygon), dtype=wp.vec3)
   # multiccd_pnormal: plane normal of clipping polygon
-  multiccd_pnormal = wp.empty(shape=(d.naccdmax, nmaxpolygon), dtype=wp.vec3)
+  multiccd_pnormal = wp.empty(shape=(scratch_rows, nmaxpolygon), dtype=wp.vec3)
   # multiccd_pdist: plane distance of clipping polygon
-  multiccd_pdist = wp.empty(shape=(d.naccdmax, nmaxpolygon), dtype=float)
+  multiccd_pdist = wp.empty(shape=(scratch_rows, nmaxpolygon), dtype=float)
   # multiccd_idx1: list of normal index candidates for Geom 1
-  multiccd_idx1 = wp.empty(shape=(d.naccdmax, nmaxmeshdeg), dtype=int)
+  multiccd_idx1 = wp.empty(shape=(scratch_rows, nmaxmeshdeg), dtype=int)
   # multiccd_idx2: list of normal index candidates for Geom 2
-  multiccd_idx2 = wp.empty(shape=(d.naccdmax, nmaxmeshdeg), dtype=int)
+  multiccd_idx2 = wp.empty(shape=(scratch_rows, nmaxmeshdeg), dtype=int)
   # multiccd_n1: list of normal candidates for Geom 1
-  multiccd_n1 = wp.empty(shape=(d.naccdmax, nmaxmeshdeg), dtype=wp.vec3)
+  multiccd_n1 = wp.empty(shape=(scratch_rows, nmaxmeshdeg), dtype=wp.vec3)
   # multiccd_n2: list of normal candidates for Geom 1
-  multiccd_n2 = wp.empty(shape=(d.naccdmax, nmaxmeshdeg), dtype=wp.vec3)
+  multiccd_n2 = wp.empty(shape=(scratch_rows, nmaxmeshdeg), dtype=wp.vec3)
   # multiccd_endvert: list of edge vertices candidates
-  multiccd_endvert = wp.empty(shape=(d.naccdmax, nmaxmeshdeg), dtype=wp.vec3)
+  multiccd_endvert = wp.empty(shape=(scratch_rows, nmaxmeshdeg), dtype=wp.vec3)
   # multiccd_face1: contact face
-  multiccd_face1 = wp.empty(shape=(d.naccdmax, nmaxpolygon), dtype=wp.vec3)
+  multiccd_face1 = wp.empty(shape=(scratch_rows, nmaxpolygon), dtype=wp.vec3)
   # multiccd_face2: contact face
-  multiccd_face2 = wp.empty(shape=(d.naccdmax, nmaxpolygon), dtype=wp.vec3)
+  multiccd_face2 = wp.empty(shape=(scratch_rows, nmaxpolygon), dtype=wp.vec3)
 
   # Launch non-heightfield collision kernels (no hfield args, 78 args total)
   for geom_pair in collision_table:
@@ -1337,17 +1375,20 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
     g2 = geom_pair[1].value
     count, geomgeomid = _pair_count(g1, g2)
     if g1 != GeomType.HFIELD and g2 != GeomType.HFIELD and count:
-      ccd_k = ccd_kernel_builder(
-        g1,
-        g2,
-        m.opt.ccd_iterations,
-        epa_iterations,
-        use_multiccd,
-        geomgeomid,
-        m.block_dim.convex_ccd,
-        bool(m.opt.warn_overflow),
-      )
-      ccd_grid = _ccd_grid_size(ccd_k, d.naconmax, d.ncollision.device)
+      if thread_scratch:
+        ccd_k, ccd_grid = ccd_kernels[(g1, g2)]
+      else:
+        ccd_k = ccd_kernel_builder(
+          g1,
+          g2,
+          m.opt.ccd_iterations,
+          epa_iterations,
+          use_multiccd,
+          geomgeomid,
+          m.block_dim.convex_ccd,
+          bool(m.opt.warn_overflow),
+        )
+        ccd_grid = _ccd_grid_size(ccd_k, d.naconmax, d.ncollision.device)
       wp.launch(
         ccd_k,
         dim=ccd_grid,
