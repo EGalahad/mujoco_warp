@@ -9,10 +9,9 @@ and carries the backend changes used by HDMI's Weave training and playback:
   `HDMI_CCD_THREAD_SCRATCH=1` **before importing MuJoCo-Warp**. The default path
   remains upstream behavior.
 
-The validated stack uses MuJoCo 3.11.0 and Warp 1.14.0. Consumers should install
-this Git revision through their own project dependencies, rather than using
-this upstream checkout's development lockfile (which refers to an expired
-MuJoCo nightly wheel).
+The branch pins stable MuJoCo 3.11.0 and Warp 1.14.0, and removes the upstream
+nightly-only package sources. Its development lockfile also uses those stable
+releases. Consumers should pin this Git commit in their project dependencies.
 
 Validation: eight missing-mesh cases plus one mesh-mesh scratch equivalence
 case on CPU; HDMI additionally exercises the enabled path on GPU. This is not
